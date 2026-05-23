@@ -1,380 +1,339 @@
 import itertools
 import json
+from fractions import (
+    Fraction,
+)  # For converting vector directions to approximate integer [uvw]
 
-import numpy as np
-import matplotlib.pyplot as plt
 import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
 
-from orix.quaternion import Orientation
+from orix.quaternion import Orientation, Rotation
 from orix.vector import Vector3d
 
-# ----------------------DATA EXTRACTION ----------------------------
 
+# Return the selected orientations for one twin region.
+def get_selected_orientations(results, twin_key):
 
-def get_selected_orientations(axis_angle_results, twin_key):
-    """
-    Return the selected orientations for one twin.
+    result = results[twin_key]
 
-    Parameters
-    ----------
-    axis_angle_results : dict
-        Output from the axis-angle candidate-selection workflow.
-    twin_key : str
-        Twin label, for example "A", "B", "C", or "D".
-
-    Returns
-    -------
-    tilts : np.ndarray
-        Tilt angles.
-    oris : Orientation
-        Selected orientations.
-    chosen_idx : np.ndarray
-        Selected candidate index at each tilt.
-    """
-    result = axis_angle_results[twin_key]
+    if "selected_oris" in result:
+        orientations = result["selected_oris"]
+    else:
+        orientations = result["axis_oris"]
 
     return (
         result["tilts"],
-        result["axis_oris"],
+        orientations,
         result["chosen_idx"],
     )
 
 
-def get_selected_vectors(axis_angle_results, twin_key):
+def get_selected_vectors(results, twin_key):
     """
     Convert selected orientations to beam-direction vectors.
 
-    The selected orientation `g` was applied to the crystal reference direction `[001]` to obtain the corresponding beam-direction vector. This gives the zone-axis direction associated with each tilt step.
-    """
-    tilts, oris, chosen_idx = get_selected_orientations(axis_angle_results, twin_key)
+    The stereographic trajectory is constructed from
 
-    vectors = oris * Vector3d.zvector()
+        v = g * [001], where g is the selected crystal orientation.
+    """
+    tilts, orientations, chosen_idx = get_selected_orientations(
+        results,
+        twin_key,
+    )
+
+    vectors = orientations * Vector3d.zvector()
 
     return tilts, vectors, chosen_idx
 
 
-# ----------------------GEOMETRY ----------------------------
-
-
+# Fit a great-circle pole to a set of beam-direction vectors. The fitted pole is the normal of the best-fit plane through the vectors.
 def fit_arc_pole(vectors):
-    """
-    Fit a great-circle pole to a set of stereographic trajectory vectors.
 
-    The fitted pole is the normal to the best-fit plane through the
-    beam-direction vectors.
-    """
-    X = vectors.data.reshape(-1, 3)
-    X = X / np.linalg.norm(X, axis=1)[:, None]
+    data = np.asarray(vectors.data).reshape(
+        -1, 3
+    )  # reshape because orix Vector3d with multiple vectors has shape (3, N)
+    data = (
+        data / np.linalg.norm(data, axis=1)[:, None]
+    )  # Normalize vectors to unit length
 
-    _, _, vh = np.linalg.svd(X, full_matrices=False)
+    _, _, vh = (
+        np.linalg.svd(  # using single-value decomposition to find the best-fit plane normal. Alternatively, could use PCA or eigen-decomposition of the covariance matrix. chose svd for numerical stability and simplicity.
+            data,
+            full_matrices=False,
+        )
+    )
 
-    pole = vh[-1]
-    pole = pole / np.linalg.norm(pole)
+    pole = vh[
+        -1
+    ]  # the best fit plane normal is the last row of vh, corresponding to the smallest singular value. This is the direction with the least variance among the vectors
+    pole = pole / np.linalg.norm(pole)  # Normalize the pole to unit length
 
     return Vector3d(pole)
 
 
+# Choose a display sign for a pole
 def pole_for_plot(pole):
     """
-    Choose the pole sign used for plotting.
-
-    The poles +p and -p define the same great circle. This function only
-    selects the sign that is easier to display in the selected stereographic
-    hemisphere.
+    The poles +p and -p define the same great circle. For consistent plotting, the pole is flipped if its z component is negative.
+    This ensures that all poles are plotted in the upper hemisphere, avoiding point-wise reprojection artefacts while preserving the great circle geometry.
     """
-    p = pole.data.reshape(3)
+    data = np.asarray(pole.data).reshape(3)
 
-    if p[2] < 0:
-        p = -p
+    if data[2] < 0:
+        data = -data
 
-    return Vector3d(p)
+    return Vector3d(data)
 
 
-def smallest_angle(angle):
-    """
-    Return the smallest equivalent angle between two unoriented axes.
-    """
-    return min(angle, 180 - angle)
+# Return the smallest equivalent angle between two unoriented axes
+def smallest_axis_angle(angle):
+
+    return min(angle, 180.0 - angle)
 
 
 def neighbour_angle_jumps(vectors):
     """
-    Calculate angular changes between neighbouring beam-direction vectors.
-
-    These jumps are used as a continuity check for the stereographic
-    trajectory through the tilt series.
+    Calculate angular changes between neighbouring beam-direction vectors in a stereographic trajectory.
+    This quantifies the smoothness of the trajectory and can be used to identify discontinuities or artefacts.
     """
     jumps = []
 
-    for i in range(vectors.shape[0] - 1):
-        angle = float(vectors[i].angle_with(vectors[i + 1], degrees=True))
+    for i in range(vectors.shape[0] - 1):  # loop over neighbouring pairs of vectors
+        angle = float(
+            vectors[i].angle_with(  # calculate the angle between neighbouring vectors
+                vectors[
+                    i + 1
+                ],  # the angle is calculated in 3D space, to capture the true angular change in orientation
+                degrees=True,
+            )
+        )
 
         jumps.append(angle)
 
     return np.array(jumps)
 
-def smallest_symmetry_misorientation(ori_a, ori_b, symmetry):
+
+def orient_vectors_to_plot_hemisphere(vectors):
     """
-    Calculate the smallest symmetry-equivalent misorientation angle
-    between two orientations of the same crystal symmetry.
+    Put one complete trajectory in a consistent plotting hemisphere.
+
+    The same sign is applied to the full trajectory. This avoids point-by-point
+    reprojection artefacts while preserving the trajectory shape.
     """
-    ori_a = Orientation(
-        ori_a.data.squeeze(),
-        symmetry=symmetry
-    )
+    data = np.asarray(vectors.data).reshape(-1, 3)
+    data = data / np.linalg.norm(data, axis=1)[:, None]
 
-    ori_b = Orientation(
-        ori_b.data.squeeze(),
-        symmetry=symmetry
-    )
+    mean_direction = data.mean(axis=0)
 
-    equivalents_b = ori_b.equivalent()
+    if mean_direction[2] < 0:
+        data = -data
 
-    angles = np.array([
-        float(
-            ori_a.angle_with(
-                eq,
-                degrees=True
-            )
-        )
-        for eq in equivalents_b
-    ])
-
-    return float(angles.min())
-
-# ------------------ Symmetry-equivalent branch selection -------------------
+    return Vector3d(data)
 
 
-
-def get_continuous_equivalent_branch(
-    axis_angle_results,
+def get_stereographic_branch(
+    results,
     twin_key,
     symmetry,
+    reference_direction=Vector3d.zvector(),
 ):
     """
-    Construct a continuous symmetry-equivalent orientation branch.
+    Construct a continuous stereographic plotting branch.
 
-    In cubic symmetry, one physical orientation can be represented by
-    several symmetry-equivalent orientations. Near a fundamental-zone
-    boundary, the plotted representative can switch branch.
-
-    This function keeps the physical solution unchanged, but chooses a
-    continuous symmetry-equivalent representative for stereographic
-    visualization.
+    The selected physical orientations are not changed. For each selected
+    orientation, symmetry-equivalent representatives are generated with Orix.
+    The representative used for plotting is chosen by minimizing the angular change of the beam-direction vector relative to the previous tilt step.
     """
-    tilts, oris, chosen_idx = get_selected_orientations(axis_angle_results, twin_key)
+    result = results[twin_key]
 
-    oris_continuous = [oris[0]]
-
-    for i in range(1, oris.shape[0]):
-
-        previous = oris_continuous[-1]
-        current = oris[i]
-
-        equivalents = current.equivalent()
-
-        angles = np.array(
-            [float(previous.angle_with(eq, degrees=True)) for eq in equivalents]
-        )
-
-        best = equivalents[np.argmin(angles)]
-        oris_continuous.append(best)
-
-    oris_continuous = Orientation(
-        np.stack([ori.data.squeeze() for ori in oris_continuous]), symmetry=symmetry
+    tilts, orientations, chosen_idx = get_selected_orientations(
+        results,
+        twin_key,
     )
 
-    vectors_continuous = oris_continuous * Vector3d.zvector()
+    branch_orientations = []
 
-    return tilts, oris_continuous, vectors_continuous, chosen_idx
-
-
-def choose_plotting_branch(
-    axis_angle_results,
-    twin_key,
-    symmetry,
-    jump_threshold=12,
-    improvement_margin=3,
-):
-    """
-    Choose the branch used for stereographic plotting.
-
-    The original selected branch is retained when it is already continuous.
-    If the original branch contains a large jump, a continuous
-    symmetry-equivalent branch is tested. The continuous branch is used
-    only if it clearly improves the maximum neighbour-to-neighbour jump.
-    """
-    tilts_orig, vectors_orig, chosen_idx_orig = get_selected_vectors(
-        axis_angle_results, twin_key
+    first = Orientation(
+        orientations[0].data.squeeze(), # reshape because orix Orientation with multiple orientations has shape (3, N) for the axis and (N,) for the angle, so we need to squeeze to get a single orientation
+        symmetry=symmetry,
     )
 
-    jumps_orig = neighbour_angle_jumps(vectors_orig)
-    max_orig = jumps_orig.max()
+    # the first orientation is used as the starting point for the branch, and its beam-direction vector is used as the reference for choosing subsequent orientations
 
-    tilts_cont, oris_cont, vectors_cont, chosen_idx_cont = (
-        get_continuous_equivalent_branch(
-            axis_angle_results=axis_angle_results,
-            twin_key=twin_key,
+    branch_orientations.append(first)
+    previous_vector = first * reference_direction 
+
+    for i in range(1, orientations.shape[0]):
+
+        current = Orientation(
+            orientations[i].data.squeeze(),
             symmetry=symmetry,
         )
+
+        equivalents = current.equivalent() # generate all symmetry-equivalent orientations for the current tilt step
+        candidate_vectors = equivalents * reference_direction
+
+        angles = previous_vector.angle_with(
+            candidate_vectors,
+            degrees=True,
+        )
+
+        best_idx = int(np.argmin(angles))
+
+        best_orientation = equivalents[best_idx]
+        best_vector = candidate_vectors[best_idx]
+
+        branch_orientations.append(best_orientation)
+        previous_vector = best_vector
+
+    branch_orientations = Orientation(
+        np.stack([orientation.data.squeeze() for orientation in branch_orientations]),
+        symmetry=symmetry,
     )
 
-    jumps_cont = neighbour_angle_jumps(vectors_cont)
-    max_cont = jumps_cont.max()
+    branch_vectors = branch_orientations * reference_direction
 
-    use_continuous = (
-        max_orig > jump_threshold and max_cont < max_orig - improvement_margin
+    branch_vectors = orient_vectors_to_plot_hemisphere(
+        branch_vectors,
     )
 
-    if use_continuous:
-        return {
-            "tilts": tilts_cont,
-            "vectors": vectors_cont,
-            "orientations": oris_cont,
-            "chosen_idx": chosen_idx_cont,
-            "branch_type": "continuous_equivalent",
-            "jumps": jumps_cont,
-            "max_original_jump": float(max_orig),
-            "max_continuous_jump": float(max_cont),
-        }
+    jumps = neighbour_angle_jumps(
+        branch_vectors,
+    )
 
     return {
-        "tilts": tilts_orig,
-        "vectors": vectors_orig,
-        "orientations": None,
-        "chosen_idx": chosen_idx_orig,
-        "branch_type": "original",
-        "jumps": jumps_orig,
-        "max_original_jump": float(max_orig),
-        "max_continuous_jump": float(max_cont),
+        "tilts": tilts,
+        "orientations": branch_orientations,
+        "vectors": branch_vectors,
+        "chosen_idx": chosen_idx,
+        "branch_type": "stereographic_branch",
+        "jumps": jumps,
+        "max_vector_jump": float(np.max(jumps)),
+        "representative_pixel": result.get(
+            "representative_pixel",
+            result.get("pixel", None),
+        ),
     }
 
 
-def build_plotting_branches(
-    axis_angle_results,
+def build_stereographic_branches(
+    results,
     twin_keys,
     symmetry,
-    jump_threshold=12,
-    improvement_margin=3,
 ):
     """
-    Build stereographic plotting branches and fitted arc poles for all twins.
-    """
-    vectors_plot_by_twin = {}
-    arc_poles_plot = {}
-
-    for twin_key in twin_keys:
-
-        branch = choose_plotting_branch(
-            axis_angle_results=axis_angle_results,
-            twin_key=twin_key,
-            symmetry=symmetry,
-            jump_threshold=jump_threshold,
-            improvement_margin=improvement_margin,
-        )
-
-        vectors_plot_by_twin[twin_key] = branch
-        arc_poles_plot[twin_key] = fit_arc_pole(branch["vectors"])
-
-    return vectors_plot_by_twin, arc_poles_plot
-
-
-def build_vectors_and_arc_poles(axis_angle_results, twin_keys):
-    """
-    Build original selected vectors and fitted arc poles for all twins.
-
-    This is useful for comparing the unreduced plotting branches against
-    the original selected orientation representation.
+    Build stereographic branches and fitted arc poles for all twin regions.
     """
     vectors_by_twin = {}
     arc_poles = {}
 
     for twin_key in twin_keys:
 
-        tilts, vectors, chosen_idx = get_selected_vectors(axis_angle_results, twin_key)
+        branch = get_stereographic_branch(
+            results=results,
+            twin_key=twin_key,
+            symmetry=symmetry,
+        )
 
-        vectors_by_twin[twin_key] = {
-            "tilts": tilts,
-            "vectors": vectors,
-            "chosen_idx": chosen_idx,
-        }
-
-        arc_poles[twin_key] = fit_arc_pole(vectors)
+        vectors_by_twin[twin_key] = branch
+        arc_poles[twin_key] = fit_arc_pole(
+            branch["vectors"],
+        )
 
     return vectors_by_twin, arc_poles
 
 
-# ---------------------- PLOTTING ----------------------------
-
-
 def plot_ipf_overview(
-    axis_angle_results,
+    results,
     twin_keys,
     point_group,
+    title="IPF overview",
 ):
-    """
-    Plot selected orientations for all twins in side-by-side m-3m IPFs.
-
-    This plot is an overview of how the selected orientations are
-    represented inside the cubic fundamental zone.
-    """
     cmap = plt.cm.plasma
 
     fig = plt.figure(figsize=(14, 4))
 
     for i, twin_key in enumerate(twin_keys):
 
-        tilts, oris, chosen_idx = get_selected_orientations(
-            axis_angle_results, twin_key
+        tilts, orientations, _ = get_selected_orientations(
+            results,
+            twin_key,
         )
 
-        norm = plt.Normalize(vmin=tilts.min(), vmax=tilts.max())
+        norm = plt.Normalize( # normalize tilts for consistent colouring across subplots
+            vmin=tilts.min(),
+            vmax=tilts.max(),
+        )
 
         colours = cmap(norm(tilts))
 
         ax = fig.add_subplot(
-            1, len(twin_keys), i + 1, projection="ipf", symmetry=point_group
+            1,
+            len(twin_keys),
+            i + 1,
+            projection="ipf",
+            symmetry=point_group,
         )
 
-        ax.scatter(oris, color=colours, s=90, alpha=0.9)
+        ax.scatter(
+            orientations,
+            color=colours,
+            s=90,
+            alpha=0.9,
+        )
 
-        ax.set_title(f"Twin {twin_key}", fontsize=12)
+        ax.set_title(
+            f"Twin {twin_key}",
+            fontsize=12,
+        )
 
-    fig.subplots_adjust(right=0.88)
+    fig.subplots_adjust(
+        right=0.88,
+    )
 
-    cax = fig.add_axes([0.91, 0.18, 0.015, 0.64])
+    cax = fig.add_axes(
+        [0.91, 0.18, 0.015, 0.64],
+    )
 
-    sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm = mpl.cm.ScalarMappable(
+        norm=norm,
+        cmap=cmap,
+    )
 
     sm.set_array([])
 
-    cbar = fig.colorbar(sm, cax=cax)
+    cbar = fig.colorbar(
+        sm,
+        cax=cax,
+    )
 
     cbar.set_label("Tilt")
     cbar.set_ticks(tilts)
     cbar.set_ticklabels([str(t) for t in tilts])
 
-    fig.suptitle("m-3m IPFs", fontsize=14)
+    fig.suptitle(
+        title,
+        fontsize=14,
+    )
 
     return fig
 
-
-def plot_unreduced_stereographic_trajectory(
+# plot one stereographic trajectory
+def plot_stereographic_trajectory(
     vectors,
     tilts,
-    title="Continuous unreduced stereographic trajectory",
+    title="Stereographic trajectory",
     cmap_name="plasma",
     marker_size=120,
     label_points=True,
 ):
-    """
-    Plot one stereographic trajectory without IPF symmetry reduction.
-
-    The input vectors should already represent the chosen plotting branch.
-    """
     cmap = plt.get_cmap(cmap_name)
 
-    norm = plt.Normalize(vmin=tilts.min(), vmax=tilts.max())
+    norm = plt.Normalize(
+        vmin=tilts.min(),
+        vmax=tilts.max(),
+    )
 
     colours = cmap(norm(tilts))
 
@@ -382,22 +341,42 @@ def plot_unreduced_stereographic_trajectory(
 
     ax = fig.add_subplot(111, projection="stereographic")
 
-    ax.scatter(vectors, color=colours, s=marker_size, alpha=0.95)
+    ax.scatter(
+        vectors,
+        color=colours,
+        s=marker_size,
+        alpha=0.95,
+    )
 
     if label_points:
 
         for vector, tilt in zip(vectors, tilts):
-            ax.text(vector, s=str(tilt), size=10, offset=(0, 0.04))
+            ax.text(
+                vector,
+                s=str(tilt),
+                size=10,
+                offset=(0, 0.04),
+            )
 
-    ax.set_title(title, fontsize=14)
+    ax.set_title(
+        title,
+        fontsize=14,
+    )
 
     ax.stereographic_grid(True)
 
-    sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm = mpl.cm.ScalarMappable(
+        norm=norm,
+        cmap=cmap,
+    )
 
     sm.set_array([])
 
-    cbar = fig.colorbar(sm, ax=ax, shrink=0.85)
+    cbar = fig.colorbar(
+        sm,
+        ax=ax,
+        shrink=0.85,
+    )
 
     cbar.set_label("Tilt")
 
@@ -405,24 +384,22 @@ def plot_unreduced_stereographic_trajectory(
 
     return fig
 
-
+# Plot stereographic trajectories, fitted great circles, and arc poles.
 def plot_stereographic_arcs(
     twin_list,
-    vectors_plot_by_twin,
+    vectors_by_twin,
     arc_poles,
     colors,
     title,
+    show_labels=False,
 ):
-    """
-    Plot stereographic trajectories, fitted great circles, and arc poles
-    for selected twins.
-    """
+    
     first_key = twin_list[0]
 
-    fig = vectors_plot_by_twin[first_key]["vectors"].scatter(
+    fig = vectors_by_twin[first_key]["vectors"].scatter(
         c=colors[first_key],
         s=90,
-        axes_labels=["RD", "TD", None],
+        axes_labels=["RD", "TD", None], # rolling direction, transverse direction, and no label for the z-axis (which points out of the plane)
         show_hemisphere_label=True,
         return_figure=True,
     )
@@ -431,54 +408,205 @@ def plot_stereographic_arcs(
 
     for twin_key in twin_list[1:]:
 
-        vectors_plot_by_twin[twin_key]["vectors"].scatter(
-            figure=fig, c=colors[twin_key], s=90
+        vectors_by_twin[twin_key]["vectors"].scatter(
+            figure=fig,
+            c=colors[twin_key],
+            s=90,
         )
 
     for twin_key in twin_list:
 
-        pole = pole_for_plot(arc_poles[twin_key])
+        branch = vectors_by_twin[twin_key]
 
-        pole.scatter(figure=fig, c=colors[twin_key], marker="*", s=250, reproject=True)
+        if show_labels:
+            for vector, tilt in zip(branch["vectors"], branch["tilts"]):
+                ax.text(
+                    vector,
+                    s=str(tilt),
+                    size=8,
+                    offset=(0, 0.035),
+                )
+
+        pole = pole_for_plot(
+            arc_poles[twin_key],
+        )
+
+        pole.scatter(
+            figure=fig,
+            c=colors[twin_key],
+            marker="*",
+            s=250,
+            reproject=True,
+        )
 
         pole.draw_circle(
-            figure=fig, color=colors[twin_key], linewidth=2, reproject=True
+            figure=fig,
+            color=colors[twin_key],
+            linewidth=2,
+            reproject=True,
         )
+
+    handles = [
+        plt.Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            markerfacecolor=colors[twin_key],
+            markersize=9,
+            label=f"Twin {twin_key}",
+        )
+        for twin_key in twin_list
+    ]
+
+    ax.legend(
+        handles=handles,
+        loc="upper right",
+        frameon=True,
+    )
 
     ax.set_title(title)
     ax.stereographic_grid(True)
 
     return fig
 
-
-# ---------------------- ANALYSIS ----------------------------
-
-
-def calculate_arc_pole_angles(arc_poles, twin_keys):
-    """
-    Calculate angular separations between fitted arc poles.
-    """
+# Calculate angular separations between fitted arc poles
+def calculate_arc_pole_angles(
+    arc_poles,
+    twin_keys,
+):
     arc_angle_dict = {}
 
     for a, b in itertools.combinations(twin_keys, 2):
 
-        angle = float(arc_poles[a].angle_with(arc_poles[b], degrees=True))
-
-        angle_small = smallest_angle(angle)
+        angle = float(
+            arc_poles[a].angle_with(
+                arc_poles[b],
+                degrees=True,
+            )
+        )
 
         arc_angle_dict[f"{a}{b}"] = {
             "angle": angle,
-            "smallest_equivalent": angle_small,
+            "smallest_equivalent": smallest_axis_angle(angle),
         }
 
     return arc_angle_dict
 
+# Convert a 3D vector direction to approximate integer [uvw]
+def vector_to_uvw(
+    vector,
+    max_denominator=8,
+):
+    
+    data = np.asarray(vector.data).reshape(3)
+    data = data / np.linalg.norm(data)
 
-def calculate_misorientation_vs_tilt(axis_angle_results, twin_keys):
+    nonzero = np.where(np.abs(data) > 1e-8)[0]
+
+    if len(nonzero) == 0:
+        return np.array([0, 0, 0], dtype=int)
+
+    if data[nonzero[0]] < 0:
+        data = -data
+
+    scale_index = np.argmax(np.abs(data))
+
+    scaled = data / data[scale_index]
+
+    fractions = [Fraction(float(x)).limit_denominator(max_denominator) for x in scaled] # convert the scaled vector components to fractions with limited denominators, which allows us to find a common denominator and convert all components to integers while preserving their ratios
+
+    denominators = [f.denominator for f in fractions] # find the least common multiple of the denominators to convert all fractions to a common denominator
+
+    lcm = np.lcm.reduce(denominators) # the smallest integer that all denominators divide into, allowing us to convert all fractions to integers without losing the relative ratios
+
+    uvw = np.array([int(f.numerator * lcm / f.denominator) for f in fractions])
+
+    nonzero_int = uvw[np.abs(uvw) > 0]
+
+    if len(nonzero_int) > 0:
+        gcd = np.gcd.reduce(
+            np.abs(nonzero_int),
+        )
+        uvw = uvw // gcd
+
+    return uvw
+
+#  Return fitted arc poles as unit vectors and approximate [uvw] directions.
+def summarize_arc_poles(
+    arc_poles,
+    twin_keys,
+    max_denominator=8,
+):
+    summary = {}
+
+    for twin_key in twin_keys:
+
+        pole = arc_poles[twin_key]
+
+        data = np.asarray(pole.data).reshape(3)
+        data = data / np.linalg.norm(data)
+
+        summary[twin_key] = {
+            "pole_xyz": data,
+            "uvw": vector_to_uvw(
+                pole,
+                max_denominator=max_denominator,
+            ),
+        }
+
+    return summary
+
+def smallest_symmetry_misorientation(
+    ori_a,
+    ori_b,
+    symmetry,
+):
     """
-    Calculate pairwise misorientation between selected twin orientations.
+    Calculate the smallest symmetry-equivalent misorientation angle.
+
+    Orix has a misorientation function, but it does not consider symmetry equivalences.
+    To find the smallest symmetry-equivalent misorientation, we generate all symmetry-equivalent orientations of ori_b and calculate the misorientation angle with ori_a for each equivalent.
+    The minimum angle is the smallest symmetry-equivalent misorientation.
     """
-    tilts = axis_angle_results[twin_keys[0]]["tilts"]
+    ori_a = Orientation(
+        ori_a.data.squeeze(),
+        symmetry=symmetry,
+    )
+
+    ori_b = Orientation(
+        ori_b.data.squeeze(),
+        symmetry=symmetry,
+    )
+
+    equivalents_b = ori_b.equivalent()
+
+    angles = np.array(
+        [
+            float(
+                ori_a.angle_with(
+                    eq,
+                    degrees=True,
+                )
+            )
+            for eq in equivalents_b
+        ]
+    )
+
+    return float(
+        angles.min(),
+    )
+
+
+def calculate_pairwise_misorientation_vs_tilt(
+    results,
+    twin_keys,
+    symmetry,
+):
+    """
+    Calculate pairwise smallest symmetry-equivalent misorientation.
+    """
+    tilts = results[twin_keys[0]]["tilts"]
 
     misorientation_dict = {}
 
@@ -487,37 +615,277 @@ def calculate_misorientation_vs_tilt(axis_angle_results, twin_keys):
         key = f"{a}{b}"
         misorientation_dict[key] = []
 
-        oris_a = axis_angle_results[a]["axis_oris"]
-        oris_b = axis_angle_results[b]["axis_oris"]
+        _, oris_a, _ = get_selected_orientations(
+            results,
+            a,
+        )
 
-        for i, tilt in enumerate(tilts):
+        _, oris_b, _ = get_selected_orientations(
+            results,
+            b,
+        )
 
-            misorientation = float(oris_a[i].angle_with(oris_b[i], degrees=True))
+        for i, _ in enumerate(tilts):
 
-            misorientation_dict[key].append(misorientation)
+            misorientation = smallest_symmetry_misorientation(
+                oris_a[i],
+                oris_b[i],
+                symmetry=symmetry,
+            )
+
+            misorientation_dict[key].append(
+                misorientation,
+            )
+
+        misorientation_dict[key] = np.array(
+            misorientation_dict[key],
+        )
 
     return tilts, misorientation_dict
 
 
-def save_stereographic_summary(
-    path,
-    tilts,
-    arc_angle_dict,
-    misorientation_dict,
+def calculate_tilt_step_misorientation(
+    results,
+    twin_keys,
+    symmetry,
 ):
     """
-    Save stereographic angle and misorientation results to JSON.
+    Calculate neighbouring-step misorientation for each twin trajectory.
     """
+    step_dict = {}
+
+    for twin_key in twin_keys:
+
+        tilts, orientations, _ = get_selected_orientations(
+            results,
+            twin_key,
+        )
+
+        values = []
+
+        for i in range(len(tilts) - 1):
+
+            misorientation = smallest_symmetry_misorientation(
+                orientations[i],
+                orientations[i + 1],
+                symmetry=symmetry,
+            )
+
+            values.append(misorientation)
+
+        step_dict[twin_key] = {
+            "tilts": tilts,
+            "mid_tilts": 0.5 * (tilts[:-1] + tilts[1:]),
+            "values": np.array(values),
+        }
+
+    return step_dict
+
+
+def vector_to_uvw_from_array(
+    vector,
+    max_denominator=8,
+):
+    """
+    Convert an array-like direction to approximate integer [uvw].
+    """
+    return vector_to_uvw(
+        Vector3d(np.asarray(vector).reshape(3)),
+        max_denominator=max_denominator,
+    )
+
+
+def smallest_symmetry_misorientation_axis_angle(
+    ori_a,
+    ori_b,
+    symmetry,
+):
+    """
+    Return the smallest symmetry-equivalent misorientation in axis-angle form.
+    """
+    ori_a = Orientation(
+        ori_a.data.squeeze(),
+        symmetry=symmetry,
+    )
+
+    ori_b = Orientation(
+        ori_b.data.squeeze(),
+        symmetry=symmetry,
+    )
+
+    equivalents_b = ori_b.equivalent()
+
+    angles = np.array(
+        [
+            float(
+                ori_a.angle_with(
+                    eq,
+                    degrees=True,
+                )
+            )
+            for eq in equivalents_b
+        ]
+    )
+
+    best_idx = int(np.argmin(angles))
+    best_b = equivalents_b[best_idx]
+
+    misorientation = best_b * ~ori_a
+
+    angle = float(
+        np.rad2deg(
+            np.asarray(misorientation.angle).squeeze(),
+        )
+    )
+
+    axis = np.asarray(
+        misorientation.axis.data,
+    ).reshape(3)
+
+    axis = axis / np.linalg.norm(axis)
+
+    return {
+        "angle": angle,
+        "axis": axis,
+        "uvw": vector_to_uvw_from_array(axis),
+        "equivalent_index": best_idx,
+    }
+
+# Convert an orix Vector3d to a unit vector in numpy array form
+def _unit_vector(vector): 
+    data = np.asarray(vector.data).reshape(3)
+    return data / np.linalg.norm(data)
+
+def _same_pole_sign(moving_pole, reference_pole):
+    moving = _unit_vector(moving_pole)
+    reference = _unit_vector(reference_pole)
+
+    if np.dot(moving, reference) < 0:
+        moving = -moving
+
+    return Vector3d(moving)
+
+# Rotate one trajectory so that its arc pole overlaps a reference pole
+def align_branch_pole_to_reference(
+    vectors_by_twin,
+    arc_poles,
+    moving_key,
+    reference_key,
+):
+    """
+
+    The same rotation is applied to all beam-direction vectors in the moving
+    trajectory. Related to phase mapping techniques where a common crystallographic direction is aligned across multiple datasets for comparison.
+    Here, we align the fitted arc poles of stereographic trajectories to compare their shapes without the confounding effect of different pole orientations.
+    Physically, this could correspond to reorienting the sample or the reference frame so that a specific crystallographic direction (the arc pole) is aligned across different twin regions, allowing for a more direct comparison of their stereographic trajectories and misorientation characteristics.
+    """
+    reference_pole = pole_for_plot(
+        arc_poles[reference_key],
+    )
+
+    moving_pole = _same_pole_sign(
+        arc_poles[moving_key],
+        reference_pole,
+    )
+
+    candidate_a = Rotation.from_align_vectors(
+        reference_pole,
+        moving_pole,
+    )
+
+    candidate_b = Rotation.from_align_vectors(
+        moving_pole,
+        reference_pole,
+    )
+
+    angle_a = float(
+        (candidate_a * moving_pole).angle_with(
+            reference_pole,
+            degrees=True,
+        )
+    )
+
+    angle_b = float(
+        (candidate_b * moving_pole).angle_with(
+            reference_pole,
+            degrees=True,
+        )
+    )
+
+    if angle_a <= angle_b:
+        rotation = candidate_a
+    else:
+        rotation = candidate_b
+
+    aligned_branch = vectors_by_twin[moving_key].copy()
+    aligned_branch["vectors"] = rotation * vectors_by_twin[moving_key]["vectors"]
+    aligned_branch["branch_type"] = (
+        vectors_by_twin[moving_key]["branch_type"]
+        + f"_aligned_to_{reference_key}"
+    )
+
+    aligned_pole = rotation * arc_poles[moving_key]
+
+    angle_after = float(
+        arc_poles[reference_key].angle_with(
+            aligned_pole,
+            degrees=True,
+        )
+    )
+
+    angle_after = smallest_axis_angle(
+        angle_after,
+    )
+
+    return aligned_branch, aligned_pole, rotation, angle_after
+
+def save_stereographic_summary(
+    path,
+    twin_keys,
+    arc_poles,
+    arc_angle_dict,
+    misorientation_dict,
+    step_misorientation=None,
+):
+    """
+    Save stereographic and misorientation results to JSON.
+    """
+    arc_pole_summary = summarize_arc_poles(
+        arc_poles,
+        twin_keys,
+    )
+
     summary = {
-        "tilts": [int(t) for t in tilts],
-        "arc_pole_angles": arc_angle_dict,
+        "arc_poles": {
+            key: {
+                "pole_xyz": [float(x) for x in value["pole_xyz"]],
+                "uvw": [int(x) for x in value["uvw"]],
+            }
+            for key, value in arc_pole_summary.items()
+        },
+        "arc_pole_angles": {
+            key: {
+                "angle": float(value["angle"]),
+                "smallest_equivalent": float(value["smallest_equivalent"]),
+            }
+            for key, value in arc_angle_dict.items()
+        },
         "misorientation_vs_tilt": {
-            key: [float(x) for x in values]
-            for key, values in misorientation_dict.items()
+            key: [float(x) for x in value] for key, value in misorientation_dict.items()
         },
     }
 
+    if step_misorientation is not None:
+        summary["tilt_step_misorientation"] = {
+            key: [float(x) for x in value["values"]]
+            for key, value in step_misorientation.items()
+        }
+
     with open(path, "w") as f:
-        json.dump(summary, f, indent=4)
+        json.dump(
+            summary,
+            f,
+            indent=4,
+        )
 
     return summary
