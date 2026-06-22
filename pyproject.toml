@@ -20,4 +20,5 @@ dependencies = [
     "diffsims>=0.6.0",
     "ipywidgets>=8.1.8",
     "hyperspy-gui-ipywidgets>=2.1.0",
+    "cmasher>=1.9.2",
 ]
