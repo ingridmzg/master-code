@@ -11,3 +11,4 @@ Dependencies found in "pyproject.toml"
 - 04 template matching rois
 - 05 visualizing and validating the template matched rois based on criteria
    
+<img width="936" height="198" alt="image" src="https://github.com/user-attachments/assets/cbf25c4d-70f6-4945-8424-970fe52e8031" />
